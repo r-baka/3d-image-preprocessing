@@ -1,0 +1,151 @@
+import numpy as np
+import matplotlib.pyplot as plt
+from matplotlib.pyplot import imshow
+import tensorflow as tf
+import tensorflow.keras as keras
+from tensorflow.keras import backend as K
+from tensorflow.keras import losses
+from tensorflow.keras.models import Model, Sequential
+from tensorflow.keras.layers import Input, concatenate
+from tensorflow.keras.layers import Dense, Dropout, Flatten
+from tensorflow.keras.layers import Convolution3D, Conv3D, MaxPooling3D, Conv3DTranspose, ZeroPadding3D
+from tensorflow.keras.optimizers import Adam, Adadelta, Adamax, Nadam, Adagrad, SGD, RMSprop
+from tensorflow.keras.callbacks import ModelCheckpoint, Callback
+from tensorflow.keras.initializers import RandomUniform, RandomNormal
+from tensorflow.keras.models import load_model
+from PIL import Image
+import os
+import cv2
+import time
+
+
+class PatientData(object):
+    def __init__(self, root_dir, oi):
+        import os, re
+        
+        patient_images = {}
+
+        for root, dirs, files in os.walk(root_dir):
+            for file in files:
+                if file.endswith('.nii'):
+                    if 'PATIENT_DICOM' in root:
+                        if not patient_images.get(file,None):
+                            patient_images[file] = {}
+                        p = os.path.join(root,file)
+                        patient_images[file]['real'] = p
+                    elif 'MASKS_DICOM' in root:
+                        if not patient_images.get(file,None):
+                            patient_images[file] = {}
+                        p = os.path.join(root,file)
+                        if len(p) > 0:
+                            patient_images[file]['bone'] = p
+                import csv
+                with open('dictionary.csv', 'w') as f:
+                    for key in patient_images.keys():
+                        f.write("%s,%s\n"%(key,patient_images[key]))
+        self.oi = oi
+        self.X = []
+        self.Y = []
+
+        for k,v in patient_images.items():
+            # print('k, v: ', k, v)
+            for k1,v1 in v.items():
+                if k1 == self.oi:
+                    self.X.append(v['real'])
+                    self.Y.append(v1)
+
+        if len(self.X) != len(self.Y):
+            raise Exception("number of input images (%d) does not match number of training samples (%d)" % (len(self.X),len(self.Y)))
+
+    def normalize(self, img):
+        arr = img.copy().astype(np.float)
+        M = np.float(np.max(img))
+        if M != 0:
+            arr *= 1./M
+        return arr
+
+    def add_gauss_noise(self, inp, expected_noise_ratio=0.05):
+        image = inp.copy()
+        if len(image.shape) == 2:
+            row,col= image.shape
+            ch = 1
+        else:
+            row,col,ch= image.shape
+        mean = 0.
+        var = 0.1
+        sigma = var**0.5
+        gauss = np.random.normal(mean,sigma,(row,col)) * expected_noise_ratio
+        gauss = gauss.reshape(row,col)
+        noisy = image + gauss
+        return noisy
+
+    def get_data(self, noisy=False, split_part=1, verbose=False):  # Using 100% for training
+        from scipy.ndimage.interpolation import zoom
+        from random import shuffle
+        import pydicom
+        import nibabel as nib
+
+        im_X = []
+        im_Y = []
+        for i in range(len(self.X)):
+            img_x = nib.load(self.X[i]).get_fdata()
+            img_y = nib.load(self.Y[i]).get_fdata()
+            
+            img_x = self.normalize(img_x)
+            img_y = self.normalize(img_y)
+            
+            if np.sum(img_y) < 5.:
+                if np.random.randint(1,10) <= 5:
+                    if verbose:
+                        print("discarding a very zero like image %s (%f)" % (self.Y[i],np.sum(img_y)))
+                    continue
+
+            im_X.append(img_x)
+            im_Y.append(img_y)
+
+        train_limit = int(len(im_X)*split_part)
+
+        indexes = list(range(len(im_X)))
+        shuffle(indexes)
+
+        shuffleX = [im_X[c] for c in indexes]
+        shuffleY = [im_Y[c] for c in indexes]
+
+        train_x = shuffleX[0:train_limit]
+        test_x = shuffleX[train_limit:]
+        train_y = shuffleY[0:train_limit]
+        test_y = shuffleY[train_limit:]
+
+        return train_x, train_y, test_x, test_y
+
+root_dir = '\\3dircadb1\\'
+
+sample_height, sample_width, sample_depth, LAB = (176, 112, 112, 1)
+
+print('sample_height', sample_height)
+print('sample_width', sample_width)
+print('sample_depth', sample_depth)
+print('LAB', LAB)
+
+img_tot_size = sample_width*sample_height*sample_depth*LAB
+
+config = tf.compat.v1.ConfigProto(allow_soft_placement=True, log_device_placement=True)
+config.gpu_options.allow_growth = True
+sess = tf.compat.v1.Session(config=config)
+tf.compat.v1.keras.backend.set_session(sess)
+
+patient_data = PatientData(root_dir, 'bone')
+
+data = patient_data.get_data(False, 1) # Using 100% for training
+train_x, train_y, test_x, test_y = map(np.array, data)
+print("Using %s images for training and %s images for testing" % (len(train_x), len(test_x)))
+
+
+train_x = np.array([t.reshape(sample_width, sample_height, sample_depth, 1) for t in train_x])
+train_y = np.array([t.reshape(sample_width, sample_height, sample_depth, 1) for t in train_y])
+test_x  = np.array([t.reshape(sample_width, sample_height, sample_depth, 1) for t in test_x])
+test_y  = np.array([t.reshape(sample_width, sample_height, sample_depth, 1) for t in test_y])
+
+
+print('train_x:', train_x.shape)
+print('train_y:', train_y.shape)
